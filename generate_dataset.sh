@@ -1,0 +1,12 @@
+python3 export_edge_dataset.py \
+    --n 100 \
+    --distance 3 \
+    --rounds 4 \
+    --p 0.001 \
+    --p0 0.001 \
+    --alpha 0.0005 \
+    --period-range 1 4 \
+    --basis z \
+    --shots 1_000_000 \
+    --batch-size 1_000_000 \
+    --output-dir "./training_dataset/" \
