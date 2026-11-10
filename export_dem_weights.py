@@ -1,4 +1,4 @@
-"""Export static/oracle MWPM edge weights from the memory-experiment DEMs.
+"""Export static/oracle MWPM edge weights to both JSON and pickle (.pkl).
 
 Run this file in the same environment as surface_code_drift.py. No Monte Carlo
 shots are generated: weights depend on the circuit noise model and the fixed
@@ -14,7 +14,12 @@ Examples (from the project directory)::
         --alpha 0.0005 --period-range 10 50 --period-seed 17 \
         --phase-seed 42 --rounds 100 --include-dem --output random_weights.json
 
-The JSON contains one entry per configuration. ``decoders.static.edges`` and
+Each run saves the JSON path given by --output and a .pkl file with the same
+stem. --pkl-output can override the pickle path. Both formats contain the same
+plain Python dictionary/list structure; the pickle does not store live Stim or
+PyMatching objects.
+
+The data contains one entry per configuration. ``decoders.static.edges`` and
 ``decoders.oracle.edges`` contain the actual PyMatching edge attributes after
 Stim DEM decomposition and PyMatching parallel-edge merging. These are not
 weights independently assigned to each raw DEM error instruction. Each edge
@@ -23,9 +28,9 @@ and fault_ids (logical observable IDs). A null target denotes the virtual
 boundary. Nodes' Stim coordinates are listed separately under ``detectors``.
 The edge list is undirected, sorted by its endpoints, and numbered locally.
 
-The optional --include-dem also saves the decomposed DEM as text in the JSON.
-Existing output files require --overwrite. All numeric JSON values are finite;
-an unavailable PyMatching edge probability is represented by null.
+The optional --include-dem saves the decomposed DEM as text in both formats.
+Either existing output file requires --overwrite. All numeric values are finite;
+an unavailable PyMatching edge probability is null in JSON and None in pickle.
 
 Python API::
 
@@ -33,6 +38,11 @@ Python API::
     from export_dem_weights import export_weights
     export_weights([Configuration(3, .001, .001, .0005, 20, 100)],
                    "dem_edge_weights.json")
+
+    import pickle
+    with open("dem_edge_weights.pkl", "rb") as stream:
+        data = pickle.load(stream)
+    edges = data["configurations"][0]["decoders"]["oracle"]["edges"]
 """
 
 from __future__ import annotations
@@ -42,6 +52,7 @@ import itertools
 import json
 import math
 import os
+import pickle
 import platform
 import sys
 import tempfile
@@ -119,9 +130,13 @@ def configuration_record(config: Configuration, *, index: int, decoder: str = "b
             "round_start_drift": "none" if name == "static" else "p0 + alpha*sin(2*pi*n/R_i + phase_i)",
         }
         decoders[name] = graph
+    parameters = asdict(config)
+    if parameters["period_range"] is not None:
+        # Use the same data types after JSON and pickle deserialization.
+        parameters["period_range"] = list(parameters["period_range"])
     return {
         "configuration_index": index,
-        "parameters": {**asdict(config), "period_mode": config.period_mode, "phase_mode": config.phase_mode},
+        "parameters": {**parameters, "period_mode": config.period_mode, "phase_mode": config.phase_mode},
         "assignment_methods": {
             "period": PERIOD_ASSIGNMENT_METHOD if config.period_seed is not None else "shared",
             "phase": PHASE_ASSIGNMENT_METHOD if config.phase_seed is not None else "zero",
@@ -135,13 +150,15 @@ def configuration_record(config: Configuration, *, index: int, decoder: str = "b
 
 def export_weights(
     configurations: Iterable[Configuration], output: str | Path, *, decoder: str = "both",
-    include_dem: bool = False, overwrite: bool = False,
+    include_dem: bool = False, overwrite: bool = False, pkl_output: str | Path | None = None,
 ) -> Path:
-    """Export all configurations to one JSON file without modifying the experiment.
+    """Export all configurations to JSON and pickle; return the JSON path.
 
-    Complete construction/serialization occurs before replacing an existing
-    file. On failure the original file is preserved. A temporary file is created
-    beside the destination, keeping the final replacement on the same volume.
+    The pickle path defaults to output.with_suffix('.pkl'). Both files are
+    checked before construction and both serializations finish before publishing.
+    Each file is published with an atomic filesystem operation. Serialization
+    failures preserve existing files. A failure during publishing can leave only
+    the first file updated. Temporary files are created beside each destination.
     """
     if decoder not in ("static", "oracle", "both"):
         raise ValueError("decoder must be static, oracle, or both")
@@ -151,8 +168,12 @@ def export_weights(
     for config in configs:
         config.validate()
     output = Path(output)
-    if output.exists() and not overwrite:
-        raise FileExistsError(f"Output exists: {output}; choose another path or use --overwrite")
+    pkl_output = Path(pkl_output) if pkl_output is not None else output.with_suffix(".pkl")
+    if output.resolve() == pkl_output.resolve():
+        raise ValueError("JSON and pickle outputs must have different paths; --output is the JSON path")
+    for path in (output, pkl_output):
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"Output exists: {path}; choose another path or use --overwrite")
     document = {
         "schema_version": 1,
         "graph_type": "undirected PyMatching graph from decomposed Stim DEM",
@@ -168,38 +189,45 @@ def export_weights(
         "configurations": [configuration_record(config, index=index, decoder=decoder, include_dem=include_dem)
                            for index, config in enumerate(configs, start=1)],
     }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
+    staged = []
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", suffix=".tmp",
-                                         prefix=f".{output.name}.", dir=output.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write("\n")
-        # Repeat the existence check after construction, which can be slow for
-        # a large sweep. rename() is exclusive on Windows; replace is explicit.
-        if overwrite:
-            os.replace(temporary, output)
-        else:
-            if output.exists():
-                raise FileExistsError(f"Output appeared during export: {output}")
-            if os.name == "nt":
-                temporary.rename(output)
+        for path, binary in ((output, False), (pkl_output, True)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            options = {} if binary else {"encoding": "utf-8", "newline": "\n"}
+            with tempfile.NamedTemporaryFile(mode="wb" if binary else "w", suffix=".tmp",
+                                             prefix=f".{path.name}.", dir=path.parent,
+                                             delete=False, **options) as stream:
+                temporary = Path(stream.name)
+                staged.append((temporary, path))
+                if binary:
+                    pickle.dump(document, stream, protocol=pickle.HIGHEST_PROTOCOL)
+                else:
+                    json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
+                    stream.write("\n")
+        # Check both paths again after the potentially lengthy construction.
+        if not overwrite:
+            for _, path in staged:
+                if path.exists():
+                    raise FileExistsError(f"Output appeared during export: {path}")
+        for temporary, path in staged:
+            if overwrite:
+                os.replace(temporary, path)
+            elif os.name == "nt":
+                temporary.rename(path)
             else:
                 # Hard-linking a completed temporary file creates the final
                 # path exclusively on POSIX, avoiding rename's overwrite rule.
-                os.link(temporary, output)
+                os.link(temporary, path)
                 temporary.unlink()
-        temporary = None
     finally:
-        if temporary is not None:
+        for temporary, _ in staged:
             temporary.unlink(missing_ok=True)
     return output.resolve()
 
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rebuild the memory-experiment circuits and export their MWPM DEM edge weights to JSON.",
+        description="Rebuild the memory-experiment circuits and export their MWPM DEM edge weights to JSON and pickle.",
         epilog="Sweep options accept space/comma-separated values. All combinations are exported. No shots are sampled.",
     )
     parser.add_argument("--distance", nargs="+", default=["3"])
@@ -215,7 +243,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--basis", nargs="+", choices=["x", "z"], default=["z"])
     parser.add_argument("--decoder", choices=["static", "oracle", "both"], default="both")
     parser.add_argument("--include-dem", action="store_true", help="Include the decomposed DEM text in each decoder record")
-    parser.add_argument("--output", type=Path, default=Path("dem_edge_weights.json"))
+    parser.add_argument("--output", type=Path, default=Path("dem_edge_weights.json"), help="JSON output path")
+    parser.add_argument("--pkl-output", type=Path, help="Pickle output path (default: JSON path with .pkl suffix)")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -244,11 +273,14 @@ def main(argv: list[str] | None = None) -> int:
                                  period_range=period if period_seed is not None else None,
                                  period_seed=period_seed, phase_seed=phase_seed)
                    for distance, p, p0, alpha, period, rounds, basis, period_seed, phase_seed in itertools.product(*axes)]
-        path = export_weights(configs, args.output, decoder=args.decoder, include_dem=args.include_dem, overwrite=args.overwrite)
+        pkl_path = args.pkl_output if args.pkl_output is not None else args.output.with_suffix(".pkl")
+        path = export_weights(configs, args.output, decoder=args.decoder, include_dem=args.include_dem,
+                              overwrite=args.overwrite, pkl_output=pkl_path)
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"Export failed: {exc}", file=sys.stderr)
         return 1
     print(f"Saved {len(configs)} configuration(s), decoder={args.decoder}, to {path}")
+    print(f"Saved the same data to {pkl_path.resolve()}")
     return 0
 
 
